@@ -17,6 +17,7 @@ import os
 import warnings
 from pathlib import Path
 from dotenv import load_dotenv
+from opentelemetry import trace
 
 # Suppress OpenTelemetry warnings about None attribute values (from tracing libraries)
 warnings.filterwarnings("ignore", message="Invalid type NoneType for attribute")
@@ -820,42 +821,47 @@ async def chat(request: ChatRequest):
     # This happens AFTER trace context is set so logs correlate with the service
     # Wrap in a span to ensure trace context is available for log correlation
     try:
-        with tracer.start_as_current_span("error_simulation") as span:
-            span.set_attribute("simulate_errors", request.simulate_errors)
-            maybe_simulate_error(request.simulate_errors, stage="pre_processing")
-    except (RAGPipelineError, EmbeddingServiceError, VectorStoreConnectionError, 
-            LLMResponseError, ContextWindowExceededError, DocumentRetrievalError) as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    try:
-        if request.use_rag and retriever and llm:
-            # Use the workflow-decorated function to group all operations
-            response_text, sources = process_rag_chat(request.message)
-            logger.info("RAG chat response generated", extra={
-                "response_length": len(response_text),
-                "sources_count": len(sources) if sources else 0,
-                "mode": "rag"
-            })
-        else:
-            # Direct LLM call (single LLM span)
-            direct_llm = ChatGoogleGenerativeAI(
-                google_api_key=os.getenv("GEMINI_API_KEY"),
-                model="gemini-3.5-flash-lite",
-                temperature=0.7
+        from opentelemetry.trace import SpanKind
+        with tracer.start_as_current_span("chat gemini-3.5-flash-lite", kind=SpanKind.CLIENT) as ai_span:
+            ai_span.set_attribute("gen_ai.system", "google_genai")
+            ai_span.set_attribute("gen_ai.request.model", "gemini-3.5-flash-lite")
+            ai_span.set_attribute("gen_ai.response.model", "gemini-3.5-flash-lite")
+            ai_span.set_attribute("gen_ai.operation.name", "chat")
+            ai_span.set_attribute("gen_ai.prompt.0.content", request.message)
+
+            if request.use_rag and retriever and llm:
+                # Use the workflow-decorated function to group all operations
+                response_text, sources = process_rag_chat(request.message)
+                logger.info("RAG chat response generated", extra={
+                    "response_length": len(response_text),
+                    "sources_count": len(sources) if sources else 0,
+                    "mode": "rag"
+                })
+            else:
+                # Direct LLM call (single LLM span)
+                direct_llm = ChatGoogleGenerativeAI(
+                    google_api_key=os.getenv("GEMINI_API_KEY"),
+                    model="gemini-3.5-flash-lite",
+                    temperature=0.7,
+                    transport="rest"
+                )
+                response = direct_llm.invoke(request.message)
+                response_text = "".join(b["text"] for b in response.content if isinstance(b, dict) and "text" in b) if isinstance(response.content, list) else str(response.content)
+                sources = None
+                logger.info("Direct LLM response generated", extra={
+                    "response_length": len(response_text),
+                    "mode": "direct"
+                })
+
+            ai_span.set_attribute("gen_ai.completion.0.content", response_text)
+            ai_span.set_attribute("gen_ai.usage.input_tokens", max(1, len(request.message) // 4))
+            ai_span.set_attribute("gen_ai.usage.output_tokens", max(1, len(response_text) // 4))
+            
+            return ChatResponse(
+                response=response_text,
+                attendee_id=ATTENDEE_ID,
+                sources=sources
             )
-            response = direct_llm.invoke(request.message)
-            response_text = "".join(b["text"] for b in response.content if isinstance(b, dict) and "text" in b) if isinstance(response.content, list) else str(response.content)
-            sources = None
-            logger.info("Direct LLM response generated", extra={
-                "response_length": len(response_text),
-                "mode": "direct"
-            })
-        
-        return ChatResponse(
-            response=response_text,
-            attendee_id=ATTENDEE_ID,
-            sources=sources
-        )
         
     except Exception as e:
         logger.error("Error processing chat request", extra={
