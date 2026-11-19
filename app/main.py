@@ -40,7 +40,31 @@ else:
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 # ---> ADD YOUR INSTRUMENTATION CODE HERE <---
+from traceloop.sdk import Traceloop
 
+# Get Dynatrace configuration from environment
+ATTENDEE_ID = os.getenv("ATTENDEE_ID", "workshop-attendee")
+DT_ENDPOINT = os.getenv("DT_ENDPOINT")
+DT_API_TOKEN = os.getenv("DT_API_TOKEN")
+
+# ⚠️ IMPORTANT: Dynatrace requires Delta temporality for metrics
+# This MUST be set before Traceloop.init()
+os.environ["OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"] = "delta"
+
+# Initialize Traceloop with Dynatrace endpoint
+if DT_ENDPOINT and DT_API_TOKEN:
+    headers = {"Authorization": f"Api-Token {DT_API_TOKEN}"}
+    Traceloop.init(
+        app_name=f"ai-chat-service-{ATTENDEE_ID}",
+        api_endpoint=DT_ENDPOINT,
+        headers=headers
+    )
+    print(f"✅ Traceloop initialized - sending traces to Dynatrace")
+    print(f"   Service Name: ai-chat-service-{ATTENDEE_ID}")
+    print(f"   Endpoint: {DT_ENDPOINT}")
+else:
+    print("⚠️  Dynatrace configuration not found. Traceloop not initialized.")
+    print("   Please set DT_ENDPOINT and DT_API_TOKEN in your .env file")
 
 
 
@@ -116,7 +140,9 @@ from pydantic import BaseModel
 from typing import Optional, List
 import chromadb
 from chromadb.config import Settings
-from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+# from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate
@@ -578,7 +604,7 @@ def generate_response(question: str, context: str) -> str:
     ]
     
     response = llm.invoke(messages)
-    return response.content
+    return "".join(b["text"] for b in response.content if isinstance(b, dict) and "text" in b) if isinstance(response.content, list) else str(response.content)
 
 def summarize_sources(docs: list) -> list:
     """
@@ -607,77 +633,102 @@ def analyze_query_intent(query: str) -> dict:
     Query: {query}"""
     
     result = llm.invoke([HumanMessage(content=classification_prompt)])
-    return {"intent": result.content.strip().lower(), "query": query}
+    content = "".join(b["text"] for b in result.content if isinstance(b, dict) and "text" in b) if isinstance(result.content, list) else str(result.content)
+    return {"intent": content.strip().lower(), "query": query}
 
 def initialize_rag():
     """Initialize the RAG components with sample documents"""
     global embeddings, vectorstore, qa_chain, retriever, llm
-    
+
     try:
-        # Initialize Azure OpenAI embeddings
-        embeddings = AzureOpenAIEmbeddings(
-            azure_endpoint=AZURE_OPENAI_ENDPOINT,
-            api_key=AZURE_OPENAI_API_KEY,
-            azure_deployment=AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
-            api_version=AZURE_OPENAI_API_VERSION
+        # Gemini embeddings
+        embeddings = GoogleGenerativeAIEmbeddings(
+            google_api_key=os.getenv("GEMINI_API_KEY"),
+            model="models/gemini-embedding-001"
         )
-        
+
         # Create text splitter
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=500,
             chunk_overlap=50
         )
-        
+
         # Split documents
         docs = text_splitter.create_documents(SAMPLE_DOCUMENTS)
-        
+
         # Create vector store
         vectorstore = Chroma.from_documents(
             documents=docs,
             embedding=embeddings,
             collection_name=f"workshop_{ATTENDEE_ID}"
         )
-        
+
         # Create retriever
         retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-        
-        # Initialize Azure OpenAI LLM (stored globally for reuse)
-        llm = AzureChatOpenAI(
-            azure_endpoint=AZURE_OPENAI_ENDPOINT,
-            api_key=AZURE_OPENAI_API_KEY,
-            azure_deployment=AZURE_OPENAI_CHAT_DEPLOYMENT,
-            api_version=AZURE_OPENAI_API_VERSION,
-            temperature=0.7,
-            model=AZURE_OPENAI_CHAT_DEPLOYMENT
+
+        # Gemini chat model
+        llm = ChatGoogleGenerativeAI(
+            google_api_key=os.getenv("GEMINI_API_KEY"),
+            model="gemini-3.5-flash-lite",
+            temperature=0.7
         )
-        
-        # Create prompt template (uses extended system prompt for caching)
-        prompt = ChatPromptTemplate.from_template(RAG_SYSTEM_PROMPT + "\n\nQuestion: {question}\n\nAnswer:")
-        
-        # Create RAG chain using LCEL
+
+
+        # Prompt template
+        prompt = ChatPromptTemplate.from_template(
+            f"""{RAG_SYSTEM_PROMPT}
+
+            Context:
+            {{context}}
+
+            Question:
+            {{question}}
+
+            Answer:
+            """
+        )
+
+        # RAG chain
         qa_chain = (
-            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            {
+                "context": retriever | format_docs,
+                "question": RunnablePassthrough()
+            }
             | prompt
             | llm
             | StrOutputParser()
         )
-        
-        logger.info("RAG system initialized successfully", extra={
-            "attendee_id": ATTENDEE_ID,
-            "embedding_model": AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
-            "chat_model": AZURE_OPENAI_CHAT_DEPLOYMENT,
-            "document_count": len(SAMPLE_DOCUMENTS)
-        })
-        print(f"✅ RAG initialized successfully for attendee: {ATTENDEE_ID}")
+
+        logger.info(
+            "RAG system initialized successfully",
+            extra={
+                "attendee_id": ATTENDEE_ID,
+                "embedding_model": "gemini-embedding-001",
+                "chat_model": "gemini-2.5-flash",
+                "document_count": len(SAMPLE_DOCUMENTS)
+            }
+        )
+
+        print(
+            f"✅ RAG initialized successfully for attendee: {ATTENDEE_ID}"
+        )
+
         return True
-        
+
     except Exception as e:
-        logger.error("Failed to initialize RAG system", extra={
-            "attendee_id": ATTENDEE_ID,
-            "error": str(e)
-        })
+        logger.error(
+            "Failed to initialize RAG system",
+            extra={
+                "attendee_id": ATTENDEE_ID,
+                "error": str(e)
+            }
+        )
+
         print(f"❌ Failed to initialize RAG: {e}")
+
         return False
+
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # API Endpoints
@@ -787,16 +838,13 @@ async def chat(request: ChatRequest):
             })
         else:
             # Direct LLM call (single LLM span)
-            direct_llm = AzureChatOpenAI(
-                azure_endpoint=AZURE_OPENAI_ENDPOINT,
-                api_key=AZURE_OPENAI_API_KEY,
-                azure_deployment=AZURE_OPENAI_CHAT_DEPLOYMENT,
-                api_version=AZURE_OPENAI_API_VERSION,
-                temperature=0.7,
-                model=AZURE_OPENAI_CHAT_DEPLOYMENT
+            direct_llm = ChatGoogleGenerativeAI(
+                google_api_key=os.getenv("GEMINI_API_KEY"),
+                model="gemini-3.5-flash-lite",
+                temperature=0.7
             )
             response = direct_llm.invoke(request.message)
-            response_text = response.content
+            response_text = "".join(b["text"] for b in response.content if isinstance(b, dict) and "text" in b) if isinstance(response.content, list) else str(response.content)
             sources = None
             logger.info("Direct LLM response generated", extra={
                 "response_length": len(response_text),
